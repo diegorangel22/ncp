@@ -7,10 +7,14 @@ const ORIGINS = (process.env.ALLOWED_ORIGINS || "")
   .map((s) => s.trim())
   .filter(Boolean);
 
+// Tuneables (env overrides allowed)
+const MAX_SECTIONS = Number(process.env.MAX_SECTIONS || 12);
+const UPLOAD_CONCURRENCY = Number(process.env.UPLOAD_CONCURRENCY || 3);
+
 function dataUrlToBytes(dataUrl: string): Uint8Array {
   const i = dataUrl.indexOf(",");
   const b64 = i >= 0 ? dataUrl.slice(i + 1) : dataUrl;
-  // Use Buffer (nodejs_compat) to avoid atob typing issues during build
+  // Use Buffer (nodejs_compat) to avoid atob issues
   const buf = Buffer.from(b64, "base64");
   return new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength);
 }
@@ -71,51 +75,90 @@ export async function POST(req: Request) {
 }
 
 async function handle(origin: string, req: Request, h: string | null) {
-  // Call the Cloudflare Worker to get sections (with base64 screenshots)
-  const res = await fetch(`${CF_URL}?url=${encodeURIComponent(origin)}`, {
-    headers: { Authorization: `Bearer ${CF_TOKEN}` },
-    cf: { cacheTtl: 0, cacheEverything: false } as any,
-  });
+  try {
+    // 1) Call the Worker (it returns base64 images)
+    const res = await fetch(`${CF_URL}?url=${encodeURIComponent(origin)}`, {
+      headers: { Authorization: `Bearer ${CF_TOKEN}` },
+      cf: { cacheTtl: 0, cacheEverything: false } as any,
+    });
 
-  if (!res.ok) {
-    const text = await res.text();
-    return new Response(text, {
-      status: res.status,
+    if (!res.ok) {
+      const text = await res.text();
+      return new Response(text, {
+        status: res.status,
+        headers: { "content-type": "application/json", ...cors(h) },
+      });
+    }
+
+    const payload = (await res.json()) as {
+      sections: Array<{
+        id?: string;
+        role?: string;
+        bbox?: number[];
+        image: string; // data URL
+        confidence?: number;
+      }>;
+    };
+
+    // 2) Limit how many sections to process in v1 to avoid timeouts
+    const list = (payload.sections || []).slice(0, Math.max(0, MAX_SECTIONS));
+
+    // 3) Persist to Object Storage with limited concurrency
+    const { env } = getCloudflareContext() as any;
+    const bucket = (env as any).CLOUD_FILES as any;
+    if (!bucket) {
+      return new Response(
+        JSON.stringify({ error: "Storage binding CLOUD_FILES is missing" }),
+        { status: 500, headers: { "content-type": "application/json", ...cors(h) } }
+      );
+    }
+
+    const jobId = crypto.randomUUID();
+    const siteOrigin = new URL(req.url).origin; // e.g., https://ncp-gen.webflow.io
+    const basePath = process.env.NEXT_PUBLIC_BASE_PATH || ""; // e.g., /ncp
+
+    const sections = await pMap(
+      list,
+      UPLOAD_CONCURRENCY,
+      async (s, idx) => {
+        const bytes = dataUrlToBytes(s.image);
+        const key = `jobs/${jobId}/${s.id || `section_${idx}`}.webp`;
+        await bucket.put(key, bytes, {
+          httpMetadata: { contentType: "image/webp" },
+        });
+        const url = `${siteOrigin}${basePath}/api/images/${key}`;
+        return { ...s, image: url };
+      }
+    );
+
+    return new Response(JSON.stringify({ jobId, origin, sections }), {
+      headers: { "content-type": "application/json", ...cors(h) },
+    });
+  } catch (e: any) {
+    // Return a JSON error instead of a platform 502
+    const msg = String(e?.message || e);
+    console.error("scrape/handle error:", msg);
+    return new Response(JSON.stringify({ error: msg }), {
+      status: 500,
       headers: { "content-type": "application/json", ...cors(h) },
     });
   }
+}
 
-  const payload = (await res.json()) as {
-    sections: Array<{
-      id?: string;
-      role?: string;
-      bbox?: number[];
-      image: string; // data URL
-      confidence?: number;
-    }>;
-  };
-
-  // Persist images to Object Storage and return stable URLs
-  const { env } = getCloudflareContext() as any;
-  const bucket = (env as any).CLOUD_FILES as any;
-
-  const jobId = crypto.randomUUID();
-  const siteOrigin = new URL(req.url).origin; // e.g., https://ncp-gen.webflow.io
-  const basePath = process.env.NEXT_PUBLIC_BASE_PATH || ""; // e.g., /ncp
-
-  const sections = await Promise.all(
-    (payload.sections || []).map(async (s, idx) => {
-      const bytes = dataUrlToBytes(s.image);
-      const key = `jobs/${jobId}/${s.id || `section_${idx}`}.webp`;
-      await bucket.put(key, bytes, {
-        httpMetadata: { contentType: "image/webp" },
-      });
-      const url = `${siteOrigin}${basePath}/api/images/${key}`;
-      return { ...s, image: url };
-    })
-  );
-
-  return new Response(JSON.stringify({ jobId, origin, sections }), {
-    headers: { "content-type": "application/json", ...cors(h) },
+// simple concurrency limiter
+async function pMap<T, R>(
+  items: T[],
+  limit: number,
+  worker: (item: T, index: number) => Promise<R>
+): Promise<R[]> {
+  const ret: R[] = new Array(items.length);
+  let i = 0;
+  const runners = new Array(Math.min(limit, items.length)).fill(0).map(async () => {
+    while (i < items.length) {
+      const cur = i++;
+      ret[cur] = await worker(items[cur], cur);
+    }
   });
+  await Promise.all(runners);
+  return ret;
 }
