@@ -1,6 +1,13 @@
 {
   "cloud": {
-    "framework": "nextjs"
+    "framework": "nextjs",
+    "project_id": "70a5b918-eb4b-42d1-b352-aa1193d15313",
+    "mountPath": "/ncp",
+    "bindings": {
+      "objectStorage": [
+        { "binding": "CLOUD_FILES", "bucketName": "ncp-screens" }
+      ]
+    }
   },
   "devlink": {
     "rootDir": "./src/devlink",

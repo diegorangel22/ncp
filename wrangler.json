@@ -4,6 +4,9 @@
   "main": ".open-next/worker.js",
   "compatibility_date": "2025-03-01",
   "compatibility_flags": ["nodejs_compat"],
+  "r2_buckets": [
+    { "binding": "CLOUD_FILES", "bucket_name": "ncp-screens" }
+  ],
   "assets": {
     "binding": "ASSETS",
     "directory": ".open-next/assets"
