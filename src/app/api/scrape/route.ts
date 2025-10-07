@@ -1,5 +1,16 @@
+// ncp/src/app/api/scrape/route.ts
 import { getCloudflareContext } from "@opennextjs/cloudflare";
 
+/**
+ * Env vars expected in Webflow Cloud:
+ * - CF_WORKER_URL: e.g. https://ncp-sectionizer.diegotest.workers.dev
+ * - CF_WORKER_TOKEN: Bearer token for the Worker
+ * - ALLOWED_ORIGINS: comma-separated list of site origins allowed to call this API
+ * - NEXT_PUBLIC_BASE_PATH: your mount path (e.g. "/ncp")
+ * - WORKER_MAX (optional): default max sections requested from Worker
+ * - MAX_SECTIONS (optional): hard cap for sections after Worker returns
+ * - UPLOAD_CONCURRENCY (optional): how many parallel R2 puts (default 2)
+ */
 const CF_URL = process.env.CF_WORKER_URL!;
 const CF_TOKEN = process.env.CF_WORKER_TOKEN!;
 const ORIGINS = (process.env.ALLOWED_ORIGINS || "")
@@ -7,18 +18,11 @@ const ORIGINS = (process.env.ALLOWED_ORIGINS || "")
   .map((s) => s.trim())
   .filter(Boolean);
 
-// Tuneables (env overrides allowed)
-const MAX_SECTIONS = Number(process.env.MAX_SECTIONS || 12);
-const UPLOAD_CONCURRENCY = Number(process.env.UPLOAD_CONCURRENCY || 3);
+const DEFAULT_WORKER_MAX = Number(process.env.WORKER_MAX || 6);
+const DEFAULT_MAX_SECTIONS = Number(process.env.MAX_SECTIONS || DEFAULT_WORKER_MAX);
+const UPLOAD_CONCURRENCY = Number(process.env.UPLOAD_CONCURRENCY || 2);
 
-function dataUrlToBytes(dataUrl: string): Uint8Array {
-  const i = dataUrl.indexOf(",");
-  const b64 = i >= 0 ? dataUrl.slice(i + 1) : dataUrl;
-  // Use Buffer (nodejs_compat) to avoid atob issues
-  const buf = Buffer.from(b64, "base64");
-  return new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength);
-}
-
+// --------- tiny utils ---------
 function cors(o: string | null) {
   const ok = o && ORIGINS.includes(o);
   return {
@@ -29,20 +33,63 @@ function cors(o: string | null) {
     vary: "Origin",
   };
 }
-
 function norm(input: string) {
   const u = new URL(input.startsWith("http") ? input : `https://${input}`);
   if (!/^https?:$/.test(u.protocol)) throw new Error("bad protocol");
   return u.origin;
 }
+function clamp(n: number, lo: number, hi: number) {
+  return Math.max(lo, Math.min(hi, n));
+}
+function dataUrlToBytes(dataUrl: string): Uint8Array {
+  const i = dataUrl.indexOf(",");
+  const b64 = i >= 0 ? dataUrl.slice(i + 1) : dataUrl;
+  // nodejs_compat enables Buffer in the Cloud worker
+  const buf = Buffer.from(b64, "base64");
+  return new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength);
+}
+async function pMap<T, R>(
+  items: T[],
+  limit: number,
+  worker: (item: T, index: number) => Promise<R>
+): Promise<R[]> {
+  const ret: R[] = new Array(items.length);
+  let i = 0;
+  const runners = new Array(Math.min(limit, items.length)).fill(0).map(async () => {
+    while (i < items.length) {
+      const cur = i++;
+      ret[cur] = await worker(items[cur], cur);
+    }
+  });
+  await Promise.all(runners);
+  return ret;
+}
 
+// --------- HTTP verbs ---------
 export async function OPTIONS(req: Request) {
   return new Response(null, { headers: cors(req.headers.get("origin")) });
 }
 
 export async function GET(req: Request) {
   const h = req.headers.get("origin");
-  const q = new URL(req.url).searchParams.get("domain");
+  const u = new URL(req.url);
+
+  // Quick liveness/diagnostics
+  if (u.searchParams.get("ping") === "1") {
+    const envKeys = Object.keys(process.env || {});
+    return new Response(
+      JSON.stringify({
+        ok: true,
+        basePath: process.env.NEXT_PUBLIC_BASE_PATH || "",
+        workerUrlSet: !!CF_URL,
+        tokenSet: !!CF_TOKEN,
+        envKeys,
+      }),
+      { headers: { "content-type": "application/json", ...cors(h) } }
+    );
+  }
+
+  const q = u.searchParams.get("domain");
   if (!q) return new Response("Missing domain", { status: 400, headers: cors(h) });
   return handle(norm(q), req, h);
 }
@@ -74,38 +121,77 @@ export async function POST(req: Request) {
   return handle(norm(domain), req, h);
 }
 
+// --------- main handler ---------
 async function handle(origin: string, req: Request, h: string | null) {
   try {
-    // 1) Call the Worker (it returns base64 images)
-    const res = await fetch(`${CF_URL}?url=${encodeURIComponent(origin)}`, {
+    const u = new URL(req.url);
+
+    // Allow raw proxy (skip storage) for debugging
+    const raw = u.searchParams.get("raw") === "1";
+
+    // Compute limits; let query override defaults (clamped 1..12)
+    const qMax = Number(u.searchParams.get("max") || "");
+    const workerMax = clamp(qMax || DEFAULT_WORKER_MAX, 1, 12);
+    const maxSections = clamp(
+      Number(process.env.MAX_SECTIONS || DEFAULT_MAX_SECTIONS || workerMax),
+      1,
+      workerMax
+    );
+
+    // Build Worker URL:
+    // - map ?domain=<...> -> ?url=<...>
+    // - forward ALL other query params (mode, vw, vh, hcap, q, budget, px, max, raw, etc.)
+    const worker = new URL(CF_URL);
+    worker.searchParams.set("url", origin);
+    for (const [k, v] of u.searchParams) {
+      if (k === "domain") continue;
+      worker.searchParams.set(k, v);
+    }
+    // Ensure max is present
+    if (!worker.searchParams.get("max")) worker.searchParams.set("max", String(workerMax));
+
+    // Call the Worker
+    const wres = await fetch(worker.toString(), {
       headers: { Authorization: `Bearer ${CF_TOKEN}` },
       cf: { cacheTtl: 0, cacheEverything: false } as any,
     });
 
-    if (!res.ok) {
-      const text = await res.text();
-      return new Response(text, {
-        status: res.status,
+    // If raw mode requested, proxy the Worker response as-is
+    if (raw) {
+      const body = await wres.text();
+      return new Response(body, {
+        status: wres.status,
         headers: { "content-type": "application/json", ...cors(h) },
       });
     }
 
-    const payload = (await res.json()) as {
-      sections: Array<{
+    // Otherwise, parse JSON and persist images to Object Storage
+    if (!wres.ok) {
+      const text = await wres.text();
+      return new Response(text, {
+        status: wres.status,
+        headers: { "content-type": "application/json", ...cors(h) },
+      });
+    }
+
+    const payload = (await wres.json()) as {
+      sections?: Array<{
         id?: string;
         role?: string;
         bbox?: number[];
-        image: string; // data URL
+        image: string; // data URL from Worker
         confidence?: number;
       }>;
+      meta?: any;
     };
 
-    // 2) Limit how many sections to process in v1 to avoid timeouts
-    const list = (payload.sections || []).slice(0, Math.max(0, MAX_SECTIONS));
+    const list = (payload.sections || []).slice(0, maxSections);
 
-    // 3) Persist to Object Storage with limited concurrency
+    // Storage binding
     const { env } = getCloudflareContext() as any;
-    const bucket = (env as any).CLOUD_FILES as any;
+    const bucket = (env as any).CLOUD_FILES as {
+      put: (key: string, value: Uint8Array, options: { httpMetadata: { contentType: string } }) => Promise<void>;
+    };
     if (!bucket) {
       return new Response(
         JSON.stringify({ error: "Storage binding CLOUD_FILES is missing" }),
@@ -114,17 +200,18 @@ async function handle(origin: string, req: Request, h: string | null) {
     }
 
     const jobId = crypto.randomUUID();
-    const siteOrigin = new URL(req.url).origin; // e.g., https://ncp-gen.webflow.io
-    const basePath = process.env.NEXT_PUBLIC_BASE_PATH || ""; // e.g., /ncp
+    const siteOrigin = new URL(req.url).origin; // e.g. https://ncp-gen.webflow.io
+    const basePath = process.env.NEXT_PUBLIC_BASE_PATH || ""; // e.g. /ncp
 
     const sections = await pMap(
       list,
       UPLOAD_CONCURRENCY,
       async (s, idx) => {
         const bytes = dataUrlToBytes(s.image);
-        const key = `jobs/${jobId}/${s.id || `section_${idx}`}.webp`;
+        // Worker currently emits JPEG; adjust if you switch to webp/png
+        const key = `jobs/${jobId}/${s.id || `section_${idx}`}.jpg`;
         await bucket.put(key, bytes, {
-          httpMetadata: { contentType: "image/webp" },
+          httpMetadata: { contentType: "image/jpeg" },
         });
         const url = `${siteOrigin}${basePath}/api/images/${key}`;
         return { ...s, image: url };
@@ -135,30 +222,10 @@ async function handle(origin: string, req: Request, h: string | null) {
       headers: { "content-type": "application/json", ...cors(h) },
     });
   } catch (e: any) {
-    // Return a JSON error instead of a platform 502
     const msg = String(e?.message || e);
-    console.error("scrape/handle error:", msg);
     return new Response(JSON.stringify({ error: msg }), {
       status: 500,
       headers: { "content-type": "application/json", ...cors(h) },
     });
   }
-}
-
-// simple concurrency limiter
-async function pMap<T, R>(
-  items: T[],
-  limit: number,
-  worker: (item: T, index: number) => Promise<R>
-): Promise<R[]> {
-  const ret: R[] = new Array(items.length);
-  let i = 0;
-  const runners = new Array(Math.min(limit, items.length)).fill(0).map(async () => {
-    while (i < items.length) {
-      const cur = i++;
-      ret[cur] = await worker(items[cur], cur);
-    }
-  });
-  await Promise.all(runners);
-  return ret;
 }
