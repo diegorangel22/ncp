@@ -41,12 +41,18 @@ function norm(input: string) {
 function clamp(n: number, lo: number, hi: number) {
   return Math.max(lo, Math.min(hi, n));
 }
-function dataUrlToBytes(dataUrl: string): Uint8Array {
-  const i = dataUrl.indexOf(",");
-  const b64 = i >= 0 ? dataUrl.slice(i + 1) : dataUrl;
-  // nodejs_compat enables Buffer in the Cloud worker
-  const buf = Buffer.from(b64, "base64");
-  return new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength);
+// SAFE decoder: returns null for bad/undefined inputs (avoids .indexOf on undefined)
+function safeDataUrlToBytes(maybeDataUrl: unknown): Uint8Array | null {
+  if (typeof maybeDataUrl !== "string") return null;
+  const i = maybeDataUrl.indexOf(",");
+  if (i < 0) return null;
+  const b64 = maybeDataUrl.slice(i + 1);
+  try {
+    const buf = Buffer.from(b64, "base64");
+    return new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength);
+  } catch {
+    return null;
+  }
 }
 async function pMap<T, R>(
   items: T[],
@@ -179,14 +185,14 @@ async function handle(origin: string, req: Request, h: string | null) {
         id?: string;
         role?: string;
         bbox?: number[];
-        image?: string;        // single data URL
-        images?: string[];     // tiles as data URLs
+        image?: unknown;        // single data URL
+        images?: unknown[];     // tiles as data URLs
         confidence?: number;
       }>;
       meta?: any;
     };
 
-    const list = (payload.sections || []).slice(0, maxSections);
+    const list = Array.isArray(payload.sections) ? payload.sections.slice(0, maxSections) : [];
 
     // Storage binding
     const { env } = getCloudflareContext() as any;
@@ -204,7 +210,7 @@ async function handle(origin: string, req: Request, h: string | null) {
     const siteOrigin = new URL(req.url).origin; // e.g. https://ncp-gen.webflow.io
     const basePath = process.env.NEXT_PUBLIC_BASE_PATH || ""; // e.g. /ncp
 
-    type In = { id?: string; role?: string; bbox?: number[]; image?: string; images?: string[]; confidence?: number; };
+    type In = { id?: string; role?: string; bbox?: number[]; image?: unknown; images?: unknown[]; confidence?: number; };
     type Out = { id?: string; role?: string; bbox?: number[]; image?: string; images?: string[]; confidence?: number; };
 
     const sections = await pMap<In, Out>(
@@ -213,30 +219,31 @@ async function handle(origin: string, req: Request, h: string | null) {
       async (s, idx) => {
         const safeId = s.id || `section_${idx}`;
 
-        // If the Worker returned tiled images:
+        // Tiled images (array)
         if (Array.isArray(s.images) && s.images.length) {
           const urls: string[] = [];
-          // Upload tiles sequentially per section to keep memory/CPU lower
           for (let t = 0; t < s.images.length; t++) {
-            const bytes = dataUrlToBytes(s.images[t]);
+            const bytes = safeDataUrlToBytes(s.images[t]);
+            if (!bytes) continue; // skip invalid/missing tiles safely
             const key = `jobs/${jobId}/${safeId}/tile_${String(t).padStart(2, "0")}.jpg`;
             await bucket.put(key, bytes, { httpMetadata: { contentType: "image/jpeg" } });
             urls.push(`${siteOrigin}${basePath}/api/images/${key}`);
           }
-          return { ...s, images: urls };
+          // Even if some tiles were skipped, return those that succeeded
+          return { ...cleanSectionMeta(s), images: urls };
         }
 
-        // Else, single image
-        if (s.image) {
-          const bytes = dataUrlToBytes(s.image);
+        // Single image
+        const bytes = safeDataUrlToBytes(s.image);
+        if (bytes) {
           const key = `jobs/${jobId}/${safeId}.jpg`;
           await bucket.put(key, bytes, { httpMetadata: { contentType: "image/jpeg" } });
           const url = `${siteOrigin}${basePath}/api/images/${key}`;
-          return { ...s, image: url };
+          return { ...cleanSectionMeta(s), image: url };
         }
 
-        // Nothing to persist; pass through minimal shape
-        return { id: safeId, role: s.role, bbox: s.bbox, confidence: s.confidence };
+        // Nothing valid to persist; pass through minimal meta
+        return { ...cleanSectionMeta(s) };
       }
     );
 
@@ -250,4 +257,16 @@ async function handle(origin: string, req: Request, h: string | null) {
       headers: { "content-type": "application/json", ...cors(h) },
     });
   }
+}
+
+// Keep only serializable metadata from an incoming section
+function cleanSectionMeta(s: any) {
+  const out: any = {};
+  if (s && typeof s === "object") {
+    if (s.id) out.id = String(s.id);
+    if (s.role) out.role = String(s.role);
+    if (Array.isArray(s.bbox)) out.bbox = s.bbox.slice(0, 4);
+    if (typeof s.confidence === "number") out.confidence = s.confidence;
+  }
+  return out;
 }
