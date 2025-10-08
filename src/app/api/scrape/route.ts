@@ -9,7 +9,7 @@ import { getCloudflareContext } from "@opennextjs/cloudflare";
  * - NEXT_PUBLIC_BASE_PATH: your mount path (e.g. "/ncp")
  * - WORKER_MAX (optional): default max sections requested from Worker
  * - MAX_SECTIONS (optional): hard cap for sections after Worker returns
- * - UPLOAD_CONCURRENCY (optional): how many parallel R2 puts (default 2)
+ * - UPLOAD_CONCURRENCY (optional): how many sections to upload in parallel (default 2)
  */
 const CF_URL = process.env.CF_WORKER_URL!;
 const CF_TOKEN = process.env.CF_WORKER_TOKEN!;
@@ -140,7 +140,7 @@ async function handle(origin: string, req: Request, h: string | null) {
 
     // Build Worker URL:
     // - map ?domain=<...> -> ?url=<...>
-    // - forward ALL other query params (mode, vw, vh, hcap, q, budget, px, max, raw, etc.)
+    // - forward ALL other query params (mode, tile, tileH, tileMax, vw, vh, hcap, q, budget, px, max, raw, etc.)
     const worker = new URL(CF_URL);
     worker.searchParams.set("url", origin);
     for (const [k, v] of u.searchParams) {
@@ -165,7 +165,7 @@ async function handle(origin: string, req: Request, h: string | null) {
       });
     }
 
-    // Otherwise, parse JSON and persist images to Object Storage
+    // Otherwise, parse JSON and persist images/tiles to Object Storage
     if (!wres.ok) {
       const text = await wres.text();
       return new Response(text, {
@@ -179,7 +179,8 @@ async function handle(origin: string, req: Request, h: string | null) {
         id?: string;
         role?: string;
         bbox?: number[];
-        image: string; // data URL from Worker
+        image?: string;        // single data URL
+        images?: string[];     // tiles as data URLs
         confidence?: number;
       }>;
       meta?: any;
@@ -203,22 +204,43 @@ async function handle(origin: string, req: Request, h: string | null) {
     const siteOrigin = new URL(req.url).origin; // e.g. https://ncp-gen.webflow.io
     const basePath = process.env.NEXT_PUBLIC_BASE_PATH || ""; // e.g. /ncp
 
-    const sections = await pMap(
-      list,
+    type In = { id?: string; role?: string; bbox?: number[]; image?: string; images?: string[]; confidence?: number; };
+    type Out = { id?: string; role?: string; bbox?: number[]; image?: string; images?: string[]; confidence?: number; };
+
+    const sections = await pMap<In, Out>(
+      list as In[],
       UPLOAD_CONCURRENCY,
       async (s, idx) => {
-        const bytes = dataUrlToBytes(s.image);
-        // Worker currently emits JPEG; adjust if you switch to webp/png
-        const key = `jobs/${jobId}/${s.id || `section_${idx}`}.jpg`;
-        await bucket.put(key, bytes, {
-          httpMetadata: { contentType: "image/jpeg" },
-        });
-        const url = `${siteOrigin}${basePath}/api/images/${key}`;
-        return { ...s, image: url };
+        const safeId = s.id || `section_${idx}`;
+
+        // If the Worker returned tiled images:
+        if (Array.isArray(s.images) && s.images.length) {
+          const urls: string[] = [];
+          // Upload tiles sequentially per section to keep memory/CPU lower
+          for (let t = 0; t < s.images.length; t++) {
+            const bytes = dataUrlToBytes(s.images[t]);
+            const key = `jobs/${jobId}/${safeId}/tile_${String(t).padStart(2, "0")}.jpg`;
+            await bucket.put(key, bytes, { httpMetadata: { contentType: "image/jpeg" } });
+            urls.push(`${siteOrigin}${basePath}/api/images/${key}`);
+          }
+          return { ...s, images: urls };
+        }
+
+        // Else, single image
+        if (s.image) {
+          const bytes = dataUrlToBytes(s.image);
+          const key = `jobs/${jobId}/${safeId}.jpg`;
+          await bucket.put(key, bytes, { httpMetadata: { contentType: "image/jpeg" } });
+          const url = `${siteOrigin}${basePath}/api/images/${key}`;
+          return { ...s, image: url };
+        }
+
+        // Nothing to persist; pass through minimal shape
+        return { id: safeId, role: s.role, bbox: s.bbox, confidence: s.confidence };
       }
     );
 
-    return new Response(JSON.stringify({ jobId, origin, sections }), {
+    return new Response(JSON.stringify({ jobId, origin, sections, meta: payload.meta || {} }), {
       headers: { "content-type": "application/json", ...cors(h) },
     });
   } catch (e: any) {
