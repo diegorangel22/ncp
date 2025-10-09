@@ -54,6 +54,13 @@ function safeDataUrlToBytes(maybeDataUrl: unknown): Uint8Array | null {
     return null;
   }
 }
+// Extract raw base64 (no prefix) from a data URL; returns null if not a data URL string
+function safeBase64FromDataUrl(maybeDataUrl: unknown): string | null {
+  if (typeof maybeDataUrl !== "string") return null;
+  const i = maybeDataUrl.indexOf(",");
+  return i >= 0 ? maybeDataUrl.slice(i + 1) : null;
+}
+
 async function pMap<T, R>(
   items: T[],
   limit: number,
@@ -144,9 +151,12 @@ async function handle(origin: string, req: Request, h: string | null) {
       workerMax
     );
 
+    // Opt-in: include base64 in the proxied response as well
+    const includeB64 = u.searchParams.get("b64") === "1";
+
     // Build Worker URL:
     // - map ?domain=<...> -> ?url=<...>
-    // - forward ALL other query params (mode, tile, tileH, tileMax, vw, vh, hcap, q, budget, px, max, raw, etc.)
+    // - forward ALL other query params (sections, vw, vh, hcap, q, budget, px, max, b64, etc.)
     const worker = new URL(CF_URL);
     worker.searchParams.set("url", origin);
     for (const [k, v] of u.searchParams) {
@@ -162,7 +172,7 @@ async function handle(origin: string, req: Request, h: string | null) {
       cf: { cacheTtl: 0, cacheEverything: false } as any,
     });
 
-    // If raw mode requested, proxy the Worker response as-is
+    // If raw mode requested, proxy the Worker response as-is (includes *_b64 if &b64=1)
     if (raw) {
       const body = await wres.text();
       return new Response(body, {
@@ -185,9 +195,13 @@ async function handle(origin: string, req: Request, h: string | null) {
         id?: string;
         role?: string;
         bbox?: number[];
-        image?: unknown;        // single data URL
-        images?: unknown[];     // tiles as data URLs
+        image?: unknown;            // single data URL
+        images?: unknown[];         // tiles as data URLs
+        // NEW: preserve Worker-provided base64 if present
+        image_b64?: unknown;
+        images_b64?: unknown[];
         confidence?: number;
+        label?: string;
       }>;
       meta?: any;
     };
@@ -210,14 +224,36 @@ async function handle(origin: string, req: Request, h: string | null) {
     const siteOrigin = new URL(req.url).origin; // e.g. https://ncp-gen.webflow.io
     const basePath = process.env.NEXT_PUBLIC_BASE_PATH || ""; // e.g. /ncp
 
-    type In = { id?: string; role?: string; bbox?: number[]; image?: unknown; images?: unknown[]; confidence?: number; };
-    type Out = { id?: string; role?: string; bbox?: number[]; image?: string; images?: string[]; confidence?: number; };
+    type In = {
+      id?: string;
+      role?: string;
+      bbox?: number[];
+      image?: unknown;
+      images?: unknown[];
+      image_b64?: unknown;
+      images_b64?: unknown[];
+      confidence?: number;
+      label?: string;
+    };
+    type Out = {
+      id?: string;
+      role?: string;
+      bbox?: number[];
+      image?: string;
+      images?: string[];
+      // NEW (passed through if includeB64=1)
+      image_b64?: string;
+      images_b64?: string[];
+      confidence?: number;
+      label?: string;
+    };
 
     const sections = await pMap<In, Out>(
       list as In[],
       UPLOAD_CONCURRENCY,
       async (s, idx) => {
         const safeId = s.id || `section_${idx}`;
+        const baseMeta = cleanSectionMeta(s);
 
         // Tiled images (array)
         if (Array.isArray(s.images) && s.images.length) {
@@ -229,8 +265,24 @@ async function handle(origin: string, req: Request, h: string | null) {
             await bucket.put(key, bytes, { httpMetadata: { contentType: "image/jpeg" } });
             urls.push(`${siteOrigin}${basePath}/api/images/${key}`);
           }
-          // Even if some tiles were skipped, return those that succeeded
-          return { ...cleanSectionMeta(s), images: urls };
+
+          const out: Out = { ...baseMeta, images: urls };
+
+          // Preserve base64 if requested: prefer Worker-supplied images_b64, else derive from data URLs
+          if (includeB64) {
+            if (Array.isArray(s.images_b64) && s.images_b64.length) {
+              out.images_b64 = s.images_b64.filter((x): x is string => typeof x === "string");
+            } else {
+              const b64s: string[] = [];
+              for (const img of s.images) {
+                const b64 = safeBase64FromDataUrl(img);
+                if (b64) b64s.push(b64);
+              }
+              if (b64s.length) out.images_b64 = b64s;
+            }
+          }
+
+          return out;
         }
 
         // Single image
@@ -239,11 +291,29 @@ async function handle(origin: string, req: Request, h: string | null) {
           const key = `jobs/${jobId}/${safeId}.jpg`;
           await bucket.put(key, bytes, { httpMetadata: { contentType: "image/jpeg" } });
           const url = `${siteOrigin}${basePath}/api/images/${key}`;
-          return { ...cleanSectionMeta(s), image: url };
+
+          const out: Out = { ...baseMeta, image: url };
+
+          if (includeB64) {
+            if (typeof s.image_b64 === "string") {
+              out.image_b64 = s.image_b64;
+            } else {
+              const b64 = safeBase64FromDataUrl(s.image);
+              if (b64) out.image_b64 = b64;
+            }
+          }
+
+          return out;
         }
 
-        // Nothing valid to persist; pass through minimal meta
-        return { ...cleanSectionMeta(s) };
+        // Nothing valid to persist; still pass through base64 if we have it
+        const out: Out = { ...baseMeta };
+        if (includeB64) {
+          if (typeof s.image_b64 === "string") out.image_b64 = s.image_b64;
+          if (Array.isArray(s.images_b64))
+            out.images_b64 = s.images_b64.filter((x): x is string => typeof x === "string");
+        }
+        return out;
       }
     );
 
@@ -267,6 +337,7 @@ function cleanSectionMeta(s: any) {
     if (s.role) out.role = String(s.role);
     if (Array.isArray(s.bbox)) out.bbox = s.bbox.slice(0, 4);
     if (typeof s.confidence === "number") out.confidence = s.confidence;
+    if (s.label) out.label = String(s.label);
   }
   return out;
 }
