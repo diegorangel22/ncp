@@ -10,7 +10,17 @@ import { getCloudflareContext } from "@opennextjs/cloudflare";
  * - WORKER_MAX (optional): default max sections requested from Worker
  * - MAX_SECTIONS (optional): hard cap for sections after Worker returns
  * - UPLOAD_CONCURRENCY (optional): how many sections to upload in parallel (default 2)
+ * - ABSOLUTE_IMAGE_URLS (optional): "1" to return absolute URLs; default relative (same-origin)
+ * - PUBLIC_SITE_ORIGIN (optional): override public origin (proto+host) if needed
+ *
+ * Notes:
+ * - This version emits **relative** URLs for images by default, e.g. "/ncp/api/images/...".
+ *   That keeps downloads same-origin and avoids CORS errors in the browser.
+ * - If you need absolute links, set ABSOLUTE_IMAGE_URLS=1 (uses PUBLIC_SITE_ORIGIN if provided).
+ * - When the query has `&b64=1` and your Worker returns `image_b64/images_b64`,
+ *   those fields are preserved in the response (in addition to the stored image URLs).
  */
+
 const CF_URL = process.env.CF_WORKER_URL!;
 const CF_TOKEN = process.env.CF_WORKER_TOKEN!;
 const ORIGINS = (process.env.ALLOWED_ORIGINS || "")
@@ -41,7 +51,16 @@ function norm(input: string) {
 function clamp(n: number, lo: number, hi: number) {
   return Math.max(lo, Math.min(hi, n));
 }
-// SAFE decoder: returns null for bad/undefined inputs (avoids .indexOf on undefined)
+// Compute the public origin from headers, with optional env override
+function publicOrigin(req: Request) {
+  const forced = process.env.PUBLIC_SITE_ORIGIN;
+  if (forced) return forced.replace(/\/+$/, "");
+  const h = req.headers;
+  const proto = h.get("x-forwarded-proto") || "https";
+  const host = h.get("x-forwarded-host") || new URL(req.url).host;
+  return `${proto}://${host}`;
+}
+// SAFE decoder: returns null for bad/undefined inputs
 function safeDataUrlToBytes(maybeDataUrl: unknown): Uint8Array | null {
   if (typeof maybeDataUrl !== "string") return null;
   const i = maybeDataUrl.indexOf(",");
@@ -60,7 +79,6 @@ function safeBase64FromDataUrl(maybeDataUrl: unknown): string | null {
   const i = maybeDataUrl.indexOf(",");
   return i >= 0 ? maybeDataUrl.slice(i + 1) : null;
 }
-
 async function pMap<T, R>(
   items: T[],
   limit: number,
@@ -197,7 +215,7 @@ async function handle(origin: string, req: Request, h: string | null) {
         bbox?: number[];
         image?: unknown;            // single data URL
         images?: unknown[];         // tiles as data URLs
-        // NEW: preserve Worker-provided base64 if present
+        // Optional: Worker-provided base64 if &b64=1
         image_b64?: unknown;
         images_b64?: unknown[];
         confidence?: number;
@@ -221,8 +239,9 @@ async function handle(origin: string, req: Request, h: string | null) {
     }
 
     const jobId = crypto.randomUUID();
-    const siteOrigin = new URL(req.url).origin; // e.g. https://ncp-gen.webflow.io
+    const siteOrigin = publicOrigin(req);
     const basePath = process.env.NEXT_PUBLIC_BASE_PATH || ""; // e.g. /ncp
+    const absolute = process.env.ABSOLUTE_IMAGE_URLS === "1";
 
     type In = {
       id?: string;
@@ -241,7 +260,7 @@ async function handle(origin: string, req: Request, h: string | null) {
       bbox?: number[];
       image?: string;
       images?: string[];
-      // NEW (passed through if includeB64=1)
+      // Optional passthrough if includeB64=1
       image_b64?: string;
       images_b64?: string[];
       confidence?: number;
@@ -253,7 +272,13 @@ async function handle(origin: string, req: Request, h: string | null) {
       UPLOAD_CONCURRENCY,
       async (s, idx) => {
         const safeId = s.id || `section_${idx}`;
-        const baseMeta = cleanSectionMeta(s);
+        const meta = cleanSectionMeta(s);
+
+        // Helper to build final URL (relative by default)
+        const buildUrl = (key: string) => {
+          const relativeUrl = `${basePath}/api/images/${key}`;
+          return absolute ? `${siteOrigin}${relativeUrl}` : relativeUrl;
+        };
 
         // Tiled images (array)
         if (Array.isArray(s.images) && s.images.length) {
@@ -263,10 +288,10 @@ async function handle(origin: string, req: Request, h: string | null) {
             if (!bytes) continue; // skip invalid/missing tiles safely
             const key = `jobs/${jobId}/${safeId}/tile_${String(t).padStart(2, "0")}.jpg`;
             await bucket.put(key, bytes, { httpMetadata: { contentType: "image/jpeg" } });
-            urls.push(`${siteOrigin}${basePath}/api/images/${key}`);
+            urls.push(buildUrl(key));
           }
 
-          const out: Out = { ...baseMeta, images: urls };
+          const out: Out = { ...meta, images: urls };
 
           // Preserve base64 if requested: prefer Worker-supplied images_b64, else derive from data URLs
           if (includeB64) {
@@ -290,9 +315,9 @@ async function handle(origin: string, req: Request, h: string | null) {
         if (bytes) {
           const key = `jobs/${jobId}/${safeId}.jpg`;
           await bucket.put(key, bytes, { httpMetadata: { contentType: "image/jpeg" } });
-          const url = `${siteOrigin}${basePath}/api/images/${key}`;
+          const url = buildUrl(key);
 
-          const out: Out = { ...baseMeta, image: url };
+          const out: Out = { ...meta, image: url };
 
           if (includeB64) {
             if (typeof s.image_b64 === "string") {
@@ -307,7 +332,7 @@ async function handle(origin: string, req: Request, h: string | null) {
         }
 
         // Nothing valid to persist; still pass through base64 if we have it
-        const out: Out = { ...baseMeta };
+        const out: Out = { ...meta };
         if (includeB64) {
           if (typeof s.image_b64 === "string") out.image_b64 = s.image_b64;
           if (Array.isArray(s.images_b64))
